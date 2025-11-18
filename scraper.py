@@ -15,15 +15,22 @@ class MadisonLegistarScraper:
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
     
-    def fetch_events(self, start_date=None, end_date=None):
+    def fetch_events(self, start_date=None, end_date=None, body_name=None):
         """
-        Fetch events from the Legistar API with optional date filtering
+        Fetch events from the Legistar API with optional date and body name filtering
         """
         params = {}
+        filter_parts = []
+        
         if start_date:
-            params['$filter'] = f"EventDate ge datetime'{start_date}'"
-            if end_date:
-                params['$filter'] += f" and EventDate le datetime'{end_date}'"
+            filter_parts.append(f"EventDate ge datetime'{start_date}'")
+        if end_date:
+            filter_parts.append(f"EventDate le datetime'{end_date}'")
+        if body_name:
+            filter_parts.append(f"EventBodyName eq '{body_name}'")
+        
+        if filter_parts:
+            params['$filter'] = " and ".join(filter_parts)
         
         try:
             response = requests.get(self.events_url, params=params)
@@ -80,13 +87,19 @@ def main():
     parser.add_argument('--end-date', type=valid_date,
                       default=datetime.now().strftime("%Y-%m-%d"),
                       help='End date in YYYY-MM-DD format (default: today)')
+    parser.add_argument('--body-name', type=str,
+                      default=None,
+                      help='Filter by event body name (e.g., COMMON_COUNCIL)')
     
     args = parser.parse_args()
     
-    print(f"Fetching minutes from {args.start_date} to {args.end_date}")
+    filter_info = f"from {args.start_date} to {args.end_date}"
+    if args.body_name:
+        filter_info += f" for {args.body_name}"
+    print(f"Fetching minutes {filter_info}")
     
     scraper = MadisonLegistarScraper()
-    events = scraper.fetch_events(start_date=args.start_date, end_date=args.end_date)
+    events = scraper.fetch_events(start_date=args.start_date, end_date=args.end_date, body_name=args.body_name)
     
     if not events:
         print("No events found or error occurred")

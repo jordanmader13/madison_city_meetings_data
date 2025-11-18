@@ -5,6 +5,7 @@ import pandas as pd
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
+from unapproved_minutes import detect_unapproved_minutes, extend_item_text_for_unapproved
 
 @dataclass
 class VoteRecord:
@@ -36,7 +37,7 @@ class CommonCouncilVoteExtractor:
         self.vote_patterns = {
             'item_number': r'(?m)^\s*(\d+)\.\s+(\d+)',  # Matches "8. 78911" at start of line
             'sponsors': r'Sponsors?:\s*([^\n]+)',  # Matches "Sponsors: Name1, Name2"
-            'motion_type': r'(?:Adopt the Following Amendment|Adopt(?:\s+Unanimously)?)',  # Different types of motions
+            'motion_type': r'(?:Adopt the Following Amendment|Adopt(?:\s+Unanimously)?|(?:to\s+)?Call the\s+Question)',  # Different types of motions (handles newlines)
             'ayes': r'Ayes:\s*(\d+)\s*-\s*(.*?)(?=(?:\s+Noes:|Abstentions:|Recused:|Excused:|Non Voting:|$))',  # Matches "Ayes: 7- Names..."
             'noes': r'Noes:\s*(\d+)\s*-\s*(.*?)(?=(?:\s+Abstentions:|Recused:|Excused:|Non Voting:|$))',  # Matches "Noes: 12- Names..."
             'abstentions': r'Abstentions:\s*(\d+)\s*-\s*(.*?)(?=(?:\s+Recused:|Excused:|Non Voting:|$))',  # Matches "Abstentions: 1- Names..."
@@ -45,7 +46,7 @@ class CommonCouncilVoteExtractor:
             'non_voting': r'Non Voting:\s*(\d+)\s*-\s*([^;\n]+?)(?=(?:Enactment No:|City of Madison Page|\d{5,6}|$))',  # Simplified non-voting pattern
             'enactment': r'Enactment No:\s*([^\n]+)'  # Matches "Enactment No: ORD-24-00041"
         }
-        self.pdf = pdfplumber.open(pdf_path)
+        # Don't open PDF here - open it in extract_votes with context manager
 
     def __del__(self):
         """Clean up PDF resources when object is destroyed."""
@@ -151,142 +152,371 @@ class CommonCouncilVoteExtractor:
             
         return votes
 
-    def extract_votes(self) -> List[VoteRecord]:
-        """Extract all votes from the PDF."""
-        vote_records = []
-        pending_vote = None  # Track votes that might continue on next page
+    def extract_votes(self, unapproved_minutes: bool = None) -> List[VoteRecord]:
+        """
+        Extract all votes from the PDF.
         
-        # First pass: collect all text and identify page boundaries
-        pages_text = []
-        for page_num in range(len(self.pdf.pages)):
-            page = self.pdf.pages[page_num]
-            text = page.extract_text()
-            pages_text.append(text)
-            
-            print(f"\nProcessing page {page_num + 1}/{len(self.pdf.pages)}")
-            
-            # Skip pages without vote information
-            if not any(pattern in text for pattern in ["Adopt", "Ayes:", "Noes:"]):
-                print("No vote information found on page", page_num + 1)
-                continue
+        Args:
+            unapproved_minutes: If True, use special handling for unapproved minutes.
+                               If False, use standard handling.
+                               If None (default), automatically detect based on content.
+        """
+        if unapproved_minutes is None:
+            unapproved_minutes = self._detect_unapproved_minutes()
+        
+        if unapproved_minutes:
+            return self._extract_votes_unapproved()
+        else:
+            return self._extract_votes_approved()
+    
+    def _detect_unapproved_minutes(self) -> bool:
+        """Detect if minutes are unapproved."""
+        return detect_unapproved_minutes(self.pdf_path, self.vote_patterns)
+    
+    def _extract_votes_approved(self) -> List[VoteRecord]:
+        """Extract votes from approved minutes."""
+        return self._extract_votes_common(extend_item_boundaries=False)
+    
+    def _extract_votes_unapproved(self) -> List[VoteRecord]:
+        """Extract votes from unapproved minutes with narrative format."""
+        vote_records = []
+        
+        try:
+            with pdfplumber.open(self.pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                pages_text = []
                 
-            print("Found potential vote information on page", page_num + 1)
-            
-            # Find all agenda items with their Legistar numbers
-            item_matches = list(re.finditer(self.vote_patterns['item_number'], text))
-            
-            if item_matches:
-                print(f"\nFound {len(item_matches)} agenda items on page {page_num + 1}")
+                for page_num in range(total_pages):
+                    try:
+                        page = pdf.pages[page_num]
+                        text = page.extract_text(layout=False)
+                        if text is None:
+                            text = ""
+                        pages_text.append(text)
+                    except Exception:
+                        pages_text.append("")
+                        continue
                 
-                for i, match in enumerate(item_matches):
-                    item_num = match.group(1)
-                    legistar_num = match.group(2)
-                    
-                    # Get text until next item or end of text
-                    next_start = item_matches[i + 1].start() if i + 1 < len(item_matches) else len(text)
-                    item_text = text[match.start():next_start]
-                    
-                    # Check if this is a continuation of a pending vote
-                    if pending_vote and pending_vote['item_number'] == item_num:
-                        # This is a continuation - append the text
-                        pending_vote['text'] += "\n" + item_text
-                        
-                        # If we find a complete vote section (has both Ayes and either end marker or new motion),
-                        # process it and clear pending
-                        if (('Ayes:' in pending_vote['text'] and 
-                             any(marker in item_text for marker in ['City of Madison Page', 'Adopt'])) or
-                            all(marker in pending_vote['text'] for marker in ['Ayes:', 'Noes:', 'Excused:', 'Non Voting:'])):
-                            vote_record = self._process_item(
-                                item_number=pending_vote['item_number'],
-                                legistar_number=pending_vote['legistar_number'],
-                                text=pending_vote['text'],
-                                page_number=page_num + 1,
-                                motion_number=pending_vote['motion_number'],
-                                motion_title=pending_vote['motion_title'],
-                                motion_type=pending_vote['motion_type'],
-                                is_unanimous=pending_vote['is_unanimous']
-                            )
-                            if vote_record:
-                                vote_records.append(vote_record)
-                                print(f"Found complete vote record for item {item_num}, vote {pending_vote['motion_number']} ({vote_record.motion_type})")
-                            pending_vote = None
+                full_text = "\n".join(pages_text)
+                
+                # Find all narrative motions: "A motion was made by X, seconded by Y, to [motion]"
+                # Pattern handles newlines and various result formats
+                # Using [\s\S] to match any character including newlines
+                narrative_motion_pattern = r'A motion was made by\s+([^,\n]+),\s+seconded by\s+([^,\n]+),\s+to\s+([\s\S]+?)\.\s*The motion\s+([\s\S]+?)(?=\.|A motion was made by|\d+\.\s+\d{5,6}|City of Madison Page)'
+                
+                for page_num, text in enumerate(pages_text):
+                    if not text:
                         continue
                     
-                    # Find all motions in this item
-                    motion_number = 0
-                    remaining_text = item_text
-                    while True:
-                        # Find next motion type
-                        motion_match = re.search(self.vote_patterns['motion_type'], remaining_text)
-                        if not motion_match:
-                            break
-                            
-                        motion_number += 1
-                        motion_start = motion_match.start()
-                        motion_type = motion_match.group(0)
+                    # Find all items on this page
+                    item_matches = list(re.finditer(self.vote_patterns['item_number'], text))
+                    
+                    if not item_matches:
+                        continue
+                    
+                    # Find all narrative motions on this page
+                    narrative_motions = list(re.finditer(narrative_motion_pattern, text, re.IGNORECASE | re.DOTALL))
+                    
+                    for narrative_match in narrative_motions:
+                        motion_maker = narrative_match.group(1).strip()
+                        motion_seconder = narrative_match.group(2).strip()
+                        motion_text = narrative_match.group(3).strip()
+                        motion_result = narrative_match.group(4).strip()
                         
-                        # Get text until next motion or end of item
-                        next_motion = re.search(self.vote_patterns['motion_type'], remaining_text[motion_start + 1:])
-                        if next_motion:
-                            motion_text = remaining_text[motion_start:motion_start + next_motion.start() + 1]
-                            remaining_text = remaining_text[motion_start + next_motion.start() + 1:]
+                        # Find which item this motion belongs to
+                        motion_pos = narrative_match.start()
+                        item_num = None
+                        legistar_num = None
+                        
+                        for item_match in item_matches:
+                            if item_match.start() < motion_pos:
+                                item_num = item_match.group(1)
+                                legistar_num = item_match.group(2)
+                            else:
+                                break
+                        
+                        if not item_num or not legistar_num:
+                            continue
+                        
+                        # Determine if unanimous
+                        is_unanimous = (
+                            'unanimously' in motion_result.lower() or 
+                            'voice vote' in motion_result.lower() or
+                            'voice vote/other' in motion_result.lower()
+                        )
+                        
+                        # Extract motion type from motion text
+                        motion_type = "Main Motion"
+                        if 'adopt' in motion_text.lower():
+                            if 'amendment' in motion_text.lower():
+                                motion_type = "Amendment"
+                            else:
+                                motion_type = "Adopt"
+                        elif 'call the question' in motion_text.lower() or 'call question' in motion_text.lower():
+                            motion_type = "Call the Question"
+                        elif 'refer' in motion_text.lower():
+                            motion_type = "Refer"
+                        elif 'adjourn' in motion_text.lower():
+                            motion_type = "Adjourn"
+                        
+                        # Get the full text context for this motion
+                        # Find the start of the item
+                        item_start = None
+                        for item_match in item_matches:
+                            if item_match.group(1) == item_num:
+                                item_start = item_match.start()
+                                break
+                        
+                        if item_start is None:
+                            continue
+                        
+                        # Find the end of this motion's context (next motion or next item)
+                        next_narrative = re.search(narrative_motion_pattern, text[motion_pos + 1:], re.IGNORECASE | re.DOTALL)
+                        next_item = None
+                        for item_match in item_matches:
+                            if item_match.start() > motion_pos:
+                                next_item = item_match.start()
+                                break
+                        
+                        if next_narrative:
+                            motion_end = motion_pos + 1 + next_narrative.start()
+                        elif next_item:
+                            motion_end = next_item
                         else:
-                            motion_text = remaining_text[motion_start:]
-                            remaining_text = ""
+                            motion_end = min(len(text), item_start + 2000)
                         
-                        # Check if this is a unanimous vote
-                        is_unanimous = "Unanimously" in motion_type
+                        # Extract full motion context including any vote details
+                        motion_context = text[motion_pos:motion_end]
                         
-                        # Check if this vote might continue on next page
-                        if ('Ayes:' in motion_text and 
-                            not all(marker in motion_text for marker in ['Noes:', 'Excused:', 'Non Voting:'])):
-                            # This vote might continue - save it as pending
-                            pending_vote = {
-                                'item_number': item_num,
-                                'legistar_number': legistar_num,
-                                'text': motion_text,
-                                'motion_number': str(motion_number),
-                                'motion_title': motion_type,
-                                'motion_type': "Main Motion",
-                                'is_unanimous': is_unanimous
-                            }
-                            print(f"Found potentially incomplete vote for item {item_num}, vote {motion_number}")
-                        else:
-                            # Process the complete vote
-                            vote_record = self._process_item(
-                                item_number=item_num,
-                                legistar_number=legistar_num,
-                                text=motion_text,
-                                page_number=page_num + 1,
-                                motion_number=str(motion_number),
-                                motion_title=motion_type,
-                                motion_type="Main Motion",  # We'll improve this later
-                                is_unanimous=is_unanimous
-                            )
+                        # Check if there are explicit vote counts in the result
+                        has_explicit_votes = any(vote_type in motion_result for vote_type in ['Ayes:', 'Noes:', 'Abstentions:', 'Recused:', 'Excused:', 'Non Voting:'])
+                        
+                        # If there are explicit votes, they might appear after "passed by the following vote:"
+                        if has_explicit_votes or 'following vote' in motion_result.lower():
+                            # Look for vote section after the narrative
+                            vote_section_start = motion_pos + len(narrative_match.group(0))
+                            vote_section = text[vote_section_start:motion_end]
                             
-                            if vote_record:
-                                vote_records.append(vote_record)
-                                print(f"Found complete vote record for item {item_num}, vote {motion_number} ({vote_record.motion_type})")
+                            # Find where votes actually start (look for "Ayes:", "Noes:", etc.)
+                            vote_start_match = re.search(r'(Ayes|Noes|Abstentions|Recused|Excused|Non Voting):\s*\d+\s*-', vote_section, re.IGNORECASE)
+                            if vote_start_match:
+                                # Include text from vote start
+                                vote_section = vote_section[vote_start_match.start():]
+                            
+                            # Find where votes end (next motion, item, or page marker)
+                            vote_end_match = re.search(r'(?=A motion was made by|\d+\.\s+\d{5,6}|City of Madison Page|Enactment No:)', vote_section, re.IGNORECASE)
+                            if vote_end_match:
+                                vote_section = vote_section[:vote_end_match.start()]
+                            
+                            # Combine narrative and vote section
+                            full_motion_text = narrative_match.group(0) + "\n" + vote_section
+                        else:
+                            # For unanimous votes, just use the narrative text
+                            full_motion_text = narrative_match.group(0)
                         
-                        if not remaining_text:
-                            break
+                        # Create motion title
+                        motion_title = f"to {motion_text}"
+                        
+                        # Count motions for this item so far
+                        motion_count = len([r for r in vote_records if r.item_number == item_num]) + 1
+                        
+                        # Process this motion
+                        vote_record = self._process_item(
+                            item_number=item_num,
+                            legistar_number=legistar_num,
+                            text=full_motion_text,
+                            page_number=page_num + 1,
+                            motion_number=str(motion_count),
+                            motion_title=motion_title,
+                            motion_type=motion_type,
+                            is_unanimous=is_unanimous
+                        )
+                        
+                        if vote_record:
+                            vote_records.append(vote_record)
+                
+        except Exception as e:
+            print(f"ERROR processing PDF: {e}")
+            import traceback
+            traceback.print_exc()
         
-        print(f"\nTotal vote records found: {len(vote_records)}")
         return vote_records
+    
+    def _extract_votes_common(self, extend_item_boundaries: bool = False) -> List[VoteRecord]:
+        """
+        Common vote extraction logic.
+        
+        Args:
+            extend_item_boundaries: If True, extend item_text to include votes that appear
+                                   after the next item boundary
+        """
+        vote_records = []
+        pending_vote = None
+        
+        try:
+            with pdfplumber.open(self.pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                pages_text = []
+                
+                for page_num in range(total_pages):
+                    try:
+                        page = pdf.pages[page_num]
+                        text = page.extract_text(layout=False)
+                        if text is None:
+                            text = ""
+                        pages_text.append(text)
+                    except Exception as e:
+                        pages_text.append("")
+                        continue
+                
+                for page_num, text in enumerate(pages_text):
+                    if not text or not any(pattern in text for pattern in ["Adopt", "Ayes:", "Noes:"]):
+                        continue
+                    
+                    item_matches = list(re.finditer(self.vote_patterns['item_number'], text))
+            
+                    if item_matches:
+                        for i, match in enumerate(item_matches):
+                            item_num = match.group(1)
+                            legistar_num = match.group(2)
+                            
+                            next_start = item_matches[i + 1].start() if i + 1 < len(item_matches) else len(text)
+                            item_text = text[match.start():next_start]
+                            
+                            if extend_item_boundaries and i + 1 < len(item_matches):
+                                item_text = extend_item_text_for_unapproved(
+                                    item_text, item_num, text, match.start(), 
+                                    item_matches[i + 1].start()
+                                )
+                    
+                            if pending_vote and pending_vote['item_number'] == item_num:
+                                pending_vote['text'] += "\n" + item_text
+                                
+                                if (('Ayes:' in pending_vote['text'] and 
+                                     any(marker in item_text for marker in ['City of Madison Page', 'Adopt'])) or
+                                    all(marker in pending_vote['text'] for marker in ['Ayes:', 'Noes:', 'Excused:', 'Non Voting:'])):
+                                    vote_record = self._process_item(
+                                        item_number=pending_vote['item_number'],
+                                        legistar_number=pending_vote['legistar_number'],
+                                        text=pending_vote['text'],
+                                        page_number=page_num + 1,
+                                        motion_number=pending_vote['motion_number'],
+                                        motion_title=pending_vote['motion_title'],
+                                        motion_type=pending_vote['motion_type'],
+                                        is_unanimous=pending_vote['is_unanimous']
+                                    )
+                                    if vote_record:
+                                        vote_records.append(vote_record)
+                                    pending_vote = None
+                                continue
+                            
+                            motion_number = 0
+                            remaining_text = item_text
+                            max_motions = 100
+                            prev_remaining_length = len(remaining_text)
+                            
+                            while motion_number < max_motions:
+                                motion_match = re.search(self.vote_patterns['motion_type'], remaining_text)
+                                if not motion_match:
+                                    break
+                                    
+                                motion_number += 1
+                                motion_start = motion_match.start()
+                                motion_type = motion_match.group(0)
+                                
+                                next_motion = re.search(self.vote_patterns['motion_type'], remaining_text[motion_start + 1:])
+                                if next_motion:
+                                    next_motion_abs_pos = motion_start + 1 + next_motion.start()
+                                    
+                                    current_motion_normalized = motion_type.replace('to ', '').replace('\n', ' ').strip().lower()
+                                    next_motion_normalized = next_motion.group(0).replace('to ', '').replace('\n', ' ').strip().lower()
+                                    
+                                    if current_motion_normalized == next_motion_normalized or next_motion_normalized in current_motion_normalized or current_motion_normalized in next_motion_normalized:
+                                        remaining_text = remaining_text[next_motion_abs_pos:]
+                                        continue
+                                    else:
+                                        text_up_to_next = remaining_text[motion_start:next_motion_abs_pos]
+                                    
+                                    has_vote_in_text = any(vote_type in text_up_to_next for vote_type in ['Ayes:', 'Noes:', 'Abstentions:', 'Recused:', 'Excused:', 'Non Voting:'])
+                                    
+                                    if has_vote_in_text:
+                                        text_after_motion = remaining_text[motion_start:]
+                                        vote_end_marker = re.search(r'(?=A motion was made by|End of|Business Presented|City of Madison Page|\n\d+\.\s+\d{5,6}|' + re.escape(next_motion.group(0)) + r')', text_after_motion, re.IGNORECASE)
+                                        if vote_end_marker and vote_end_marker.start() < next_motion_abs_pos - motion_start:
+                                            motion_text = remaining_text[motion_start:motion_start + vote_end_marker.start()]
+                                            new_remaining = remaining_text[motion_start + vote_end_marker.start():]
+                                        else:
+                                            motion_text = text_up_to_next
+                                            new_remaining = remaining_text[next_motion_abs_pos:]
+                                    else:
+                                        motion_text = text_up_to_next
+                                        new_remaining = remaining_text[next_motion_abs_pos:]
+                                    
+                                    if len(new_remaining) >= len(remaining_text):
+                                        break
+                                    remaining_text = new_remaining
+                                else:
+                                    motion_text = remaining_text[motion_start:]
+                                    remaining_text = ""
+                                
+                                is_unanimous = "Unanimously" in motion_type
+                                
+                                has_ayes = 'Ayes:' in motion_text
+                                has_noes = 'Noes:' in motion_text
+                                has_non_voting = 'Non Voting:' in motion_text
+                                
+                                is_complete = (
+                                    not has_ayes or
+                                    (has_ayes and (has_noes or has_non_voting)) or
+                                    is_unanimous or
+                                    'voice vote' in motion_text.lower()
+                                )
+                                
+                                if has_ayes and not is_complete:
+                                    pending_vote = {
+                                        'item_number': item_num,
+                                        'legistar_number': legistar_num,
+                                        'text': motion_text,
+                                        'motion_number': str(motion_number),
+                                        'motion_title': motion_type,
+                                        'motion_type': "Main Motion",
+                                        'is_unanimous': is_unanimous
+                                    }
+                                elif is_complete:
+                                    vote_record = self._process_item(
+                                        item_number=item_num,
+                                        legistar_number=legistar_num,
+                                        text=motion_text,
+                                        page_number=page_num + 1,
+                                        motion_number=str(motion_number),
+                                        motion_title=motion_type,
+                                        motion_type="Main Motion",
+                                        is_unanimous=is_unanimous
+                                    )
+                                    
+                                    if vote_record:
+                                        vote_records.append(vote_record)
+                                
+                                if not remaining_text:
+                                    break
+                                
+                                if len(remaining_text) == prev_remaining_length:
+                                    break
+                                prev_remaining_length = len(remaining_text)
+                
+        except Exception as e:
+            print(f"ERROR processing PDF: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return vote_records
+    
 
     def _process_item(self, item_number: str, legistar_number: str, text: str, 
                      page_number: int, motion_number: str, motion_title: str,
                      motion_type: str, is_unanimous: bool) -> Optional[VoteRecord]:
         """Process a single agenda item text to extract vote information."""
-        print(f"\nProcessing {motion_type} vote {motion_number} for item {item_number}")
-        print(f"Vote text length: {len(text)} characters")
-        
-        # Create Legistar link
         legistar_link = f"https://madison.legistar.com/gateway.aspx?m=l&id=/matter.aspx?key={legistar_number}"
-        
-        # Extract description (text before the motion)
-        description = text.split(motion_title)[0].strip() if motion_title in text else ""
-        # Extract description (text before the motion)
         description = text.split(motion_title)[0].strip() if motion_title in text else ""
         
         # Initialize vote counts and lists
@@ -303,17 +533,10 @@ class CommonCouncilVoteExtractor:
         non_voting = []
         non_voting_count = 0
         
-        # For unanimous votes without explicit counts, we'll mark it specially
         if is_unanimous:
-            print("Found unanimous vote")
             ayes = ["UNANIMOUS"]
-            ayes_count = -1  # Special marker for unanimous
-            
+            ayes_count = -1
         else:
-            print("Processing non-unanimous vote...")
-            
-            # Only trim the text if we find a complete vote section followed by unrelated content
-            print("Looking for vote section boundaries...")
             vote_section_end = None
             for pattern in [
                 r'(?:Ayes|Noes|Abstentions|Recused|Excused|Non Voting):\s*\d+\s*-.*?(?=Enactment No:)',
@@ -323,59 +546,43 @@ class CommonCouncilVoteExtractor:
                     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
                     if match:
                         vote_section_end = match.end()
-                        print(f"Found vote section ending at position {vote_section_end}")
                         break
-                except Exception as e:
-                    print(f"Error searching for vote section: {e}")
+                except Exception:
+                    pass
             
             if vote_section_end:
-                print("Looking for boundaries after vote section...")
-                # Look for boundaries after the vote section
-                boundaries = [
-                    'ROLL CALL',
-                    'SWEARING IN',
-                    'CONVENE',
-                    'ADJOURN',
-                    'REFER ALL'
-                ]
+                boundaries = ['ROLL CALL', 'SWEARING IN', 'CONVENE', 'ADJOURN', 'REFER ALL']
                 remaining_text = text[vote_section_end:]
-                print(f"Remaining text length: {len(remaining_text)} characters")
                 for boundary in boundaries:
                     try:
                         match = re.search(boundary, remaining_text, re.IGNORECASE)
                         if match:
                             text = text[:vote_section_end + match.start()]
-                            print(f"Trimmed text at boundary '{boundary}'")
                             break
-                    except Exception as e:
-                        print(f"Error searching for boundary '{boundary}': {e}")
+                    except Exception:
+                        pass
             
-            print("Splitting text into vote sections...")
-            # Split text into sections based on vote type headers
+            max_text_size = 50000
+            text_to_split = text[:max_text_size] if len(text) > max_text_size else text
             try:
-                sections = re.split(r'((?:Ayes|Noes|Abstentions|Recused|Excused|Non Voting):\s*\d+\s*-\s*)', text)
-                print(f"Found {len(sections)} sections")
-            except Exception as e:
-                print(f"Error splitting text into sections: {e}")
+                sections = re.split(r'((?:Ayes|Noes|Abstentions|Recused|Excused|Non Voting):\s*\d+\s*-\s*)', text_to_split)
+            except Exception:
                 sections = []
             
             current_section = None
             current_names = []
+            max_sections = 200
+            sections_to_process = sections[:max_sections] if len(sections) > max_sections else sections
             
-            for i, section in enumerate(sections):
-                print(f"Processing section {i+1}/{len(sections)} (length: {len(section)} chars)")
+            for i, section in enumerate(sections_to_process):
                 if not section.strip():
                     continue
                 
-                # Check if this is a header
                 try:
                     header_match = re.match(r'(Ayes|Noes|Abstentions|Recused|Excused|Non Voting):\s*(\d+)\s*-\s*', section)
                     if header_match:
-                        print(f"Found header: {header_match.group(1)} with count {header_match.group(2)}")
-                        # Process previous section if exists
                         if current_section and current_names:
                             names = self.parse_names(' '.join(current_names))
-                            print(f"Processing {len(names)} names from {current_section}")
                             if current_section == 'Ayes':
                                 ayes.extend(names)
                             elif current_section == 'Noes':
@@ -389,7 +596,6 @@ class CommonCouncilVoteExtractor:
                             elif current_section == 'Non Voting':
                                 non_voting.extend(names)
                         
-                        # Start new section
                         current_section = header_match.group(1)
                         count = int(header_match.group(2))
                         if current_section == 'Ayes':
@@ -406,17 +612,14 @@ class CommonCouncilVoteExtractor:
                             non_voting_count = count
                         current_names = []
                     else:
-                        # This is content, add to current section
                         if current_section:
                             current_names.append(section)
-                except Exception as e:
-                    print(f"Error processing section {i+1}: {e}")
+                except Exception:
+                    pass
             
-            # Process the last section
             if current_section and current_names:
                 try:
                     names = self.parse_names(' '.join(current_names))
-                    print(f"Processing final section: {current_section} with {len(names)} names")
                     if current_section == 'Ayes':
                         ayes.extend(names)
                     elif current_section == 'Noes':
@@ -429,32 +632,16 @@ class CommonCouncilVoteExtractor:
                         excused.extend(names)
                     elif current_section == 'Non Voting':
                         non_voting.extend(names)
-                except Exception as e:
-                    print(f"Error processing final section: {e}")
+                except Exception:
+                    pass
             
-            # If we have a non-voting count but no names, try to extract from the text
             if non_voting_count > 0 and not non_voting:
-                print("Attempting to extract missing non-voting names...")
                 try:
                     non_voting_match = re.search(r'Non Voting:\s*\d+\s*-\s*([^;\n]+?)(?=(?:Enactment No:|City of Madison Page|\d{5,6}|$))', text)
                     if non_voting_match:
                         non_voting = self.parse_names(non_voting_match.group(1))
-                        print(f"Found {len(non_voting)} non-voting names in second pass")
-                except Exception as e:
-                    print(f"Error extracting non-voting names: {e}")
-            
-            if ayes:
-                print(f"Found {len(ayes)} ayes (count: {ayes_count}): {ayes}")
-            if noes:
-                print(f"Found {len(noes)} noes (count: {noes_count}): {noes}")
-            if abstentions:
-                print(f"Found {len(abstentions)} abstentions (count: {abstentions_count}): {abstentions}")
-            if recused:
-                print(f"Found {len(recused)} recused (count: {recused_count}): {recused}")
-            if excused:
-                print(f"Found {len(excused)} excused (count: {excused_count}): {excused}")
-            if non_voting:
-                print(f"Found {len(non_voting)} non-voting (count: {non_voting_count}): {non_voting}")
+                except Exception:
+                    pass
         
         # Return a record if we have any vote information
         if is_unanimous or any([ayes, noes, abstentions, recused, excused, non_voting]):
@@ -483,11 +670,18 @@ class CommonCouncilVoteExtractor:
             )
         return None
 
-def process_single_pdf(pdf_path: str):
-    """Process a single Common Council minutes PDF."""
-    print(f"\nProcessing single PDF: {pdf_path}")
+def process_single_pdf(pdf_path: str, unapproved_minutes: bool = None):
+    """
+    Process a single Common Council minutes PDF.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        unapproved_minutes: If True, use special handling for unapproved minutes.
+                          If False, use standard handling.
+                          If None (default), automatically detect based on content.
+    """
     extractor = CommonCouncilVoteExtractor(pdf_path)
-    vote_records = extractor.extract_votes()
+    vote_records = extractor.extract_votes(unapproved_minutes=unapproved_minutes)
     
     if vote_records:
         # Generate two output files - summary and detailed
@@ -616,136 +810,16 @@ def process_single_pdf(pdf_path: str):
         detailed_output = pdf_path.rsplit('.', 1)[0] + '_votes_detailed.csv'
         detailed_df.to_csv(detailed_output, index=False)
         
-        print(f"\nExtracted {len(summary_results)} vote records")
-        print(f"Generated {len(detailed_results)} individual vote records")
+        print(f"Extracted {len(summary_results)} vote records")
         print(f"Summary results saved to: {summary_output}")
         print(f"Detailed results saved to: {detailed_output}")
-        
-        # Validate vote counts
-        print("\nValidating vote counts...")
-        
-        # Print non-unanimous votes for verification
-        print("\nNon-unanimous votes found:")
-        vote_details = {}  # Store vote details for comparison
-        
-        for record in summary_results:
-            if not record['is_unanimous']:
-                vote_id = f"{record['item_number']}_{record['motion_number']}"
-                vote_sum = (
-                    record['total_ayes'] +
-                    record['total_noes'] +
-                    record['total_abstentions'] +
-                    record['total_excused'] +
-                    record['total_recused'] +
-                    record['total_non_voting']
-                )
-                
-                print(f"\nItem {record['item_number']}, Motion {record['motion_number']}:")
-                print(f"  Title: {record['motion_title']}")
-                print(f"  Ayes: {record['total_ayes']}")
-                print(f"  Noes: {record['total_noes']}")
-                print(f"  Abstentions: {record['total_abstentions']}")
-                print(f"  Excused: {record['total_excused']}")
-                print(f"  Recused: {record['total_recused']}")
-                print(f"  Non-voting: {record['total_non_voting']}")
-                print(f"  Total votes: {vote_sum}")
-                
-                vote_details[vote_id] = {
-                    'summary_total': vote_sum,
-                    'ayes': record['total_ayes'],
-                    'noes': record['total_noes'],
-                    'abstentions': record['total_abstentions'],
-                    'excused': record['total_excused'],
-                    'recused': record['total_recused'],
-                    'non_voting': record['total_non_voting']
-                }
-        
-        print(f"\nFound {len([r for r in summary_results if r['is_unanimous']])} unanimous votes and {len([r for r in summary_results if not r['is_unanimous']])} non-unanimous votes")
-        
-        # Count non-unanimous votes in detailed
-        non_unanimous_votes = [vote for vote in detailed_results if not vote['is_unanimous']]
-        
-        # Group detailed votes by item and motion
-        detailed_vote_counts = {}
-        for vote in non_unanimous_votes:
-            vote_id = f"{vote['item_number']}_{vote['motion_number']}"
-            if vote_id not in detailed_vote_counts:
-                detailed_vote_counts[vote_id] = {'AYE': 0, 'NO': 0, 'ABSTAIN': 0, 'EXCUSED': 0, 'RECUSED': 0, 'NON_VOTING': 0}
-            detailed_vote_counts[vote_id][vote['vote_type']] += 1
-        
-        # Compare vote counts for each item
-        print("\nDetailed vote count comparison:")
-        total_non_unanimous_in_summary = 0
-        total_non_unanimous_in_detailed = 0
-        
-        for vote_id in sorted(set(vote_details.keys()) | set(detailed_vote_counts.keys())):
-            print(f"\nVote {vote_id}:")
-            if vote_id in vote_details:
-                summary = vote_details[vote_id]
-                print("Summary counts:")
-                print(f"  Ayes: {summary['ayes']}")
-                print(f"  Noes: {summary['noes']}")
-                print(f"  Abstentions: {summary['abstentions']}")
-                print(f"  Excused: {summary['excused']}")
-                print(f"  Recused: {summary['recused']}")
-                print(f"  Non-voting: {summary['non_voting']}")
-                print(f"  Total: {summary['summary_total']}")
-                total_non_unanimous_in_summary += summary['summary_total']
-            
-            if vote_id in detailed_vote_counts:
-                detailed = detailed_vote_counts[vote_id]
-                print("Detailed counts:")
-                print(f"  Ayes: {detailed['AYE']}")
-                print(f"  Noes: {detailed['NO']}")
-                print(f"  Abstentions: {detailed['ABSTAIN']}")
-                print(f"  Excused: {detailed['EXCUSED']}")
-                print(f"  Recused: {detailed['RECUSED']}")
-                print(f"  Non-voting: {detailed['NON_VOTING']}")
-                detailed_total = sum(detailed.values())
-                print(f"  Total: {detailed_total}")
-                total_non_unanimous_in_detailed += detailed_total
-            
-            if vote_id in vote_details and vote_id in detailed_vote_counts:
-                summary_total = vote_details[vote_id]['summary_total']
-                detailed_total = sum(detailed_vote_counts[vote_id].values())
-                if summary_total != detailed_total:
-                    print(f"⚠ Mismatch for vote {vote_id}: Summary={summary_total}, Detailed={detailed_total}")
-                    print("  Differences:")
-                    if vote_details[vote_id]['ayes'] != detailed_vote_counts[vote_id]['AYE']:
-                        print(f"    Ayes: Summary={vote_details[vote_id]['ayes']}, Detailed={detailed_vote_counts[vote_id]['AYE']}")
-                    if vote_details[vote_id]['noes'] != detailed_vote_counts[vote_id]['NO']:
-                        print(f"    Noes: Summary={vote_details[vote_id]['noes']}, Detailed={detailed_vote_counts[vote_id]['NO']}")
-                    if vote_details[vote_id]['abstentions'] != detailed_vote_counts[vote_id]['ABSTAIN']:
-                        print(f"    Abstentions: Summary={vote_details[vote_id]['abstentions']}, Detailed={detailed_vote_counts[vote_id]['ABSTAIN']}")
-                    if vote_details[vote_id]['excused'] != detailed_vote_counts[vote_id]['EXCUSED']:
-                        print(f"    Excused: Summary={vote_details[vote_id]['excused']}, Detailed={detailed_vote_counts[vote_id]['EXCUSED']}")
-                    if vote_details[vote_id]['recused'] != detailed_vote_counts[vote_id]['RECUSED']:
-                        print(f"    Recused: Summary={vote_details[vote_id]['recused']}, Detailed={detailed_vote_counts[vote_id]['RECUSED']}")
-                    if vote_details[vote_id]['non_voting'] != detailed_vote_counts[vote_id]['NON_VOTING']:
-                        print(f"    Non-voting: Summary={vote_details[vote_id]['non_voting']}, Detailed={detailed_vote_counts[vote_id]['NON_VOTING']}")
-        
-        print(f"\nVote count validation (non-unanimous votes only):")
-        print(f"Total non-unanimous votes in summary file: {total_non_unanimous_in_summary}")
-        print(f"Total non-unanimous votes in detailed file: {total_non_unanimous_in_detailed}")
-        
-        if total_non_unanimous_in_summary == total_non_unanimous_in_detailed:
-            print("✓ Non-unanimous vote counts match!")
-        else:
-            print("⚠ Warning: Non-unanimous vote counts don't match!")
-            print(f"   Difference: {abs(total_non_unanimous_in_summary - total_non_unanimous_in_detailed)} votes")
-            
-            # Print detailed breakdown of non-unanimous votes for debugging
-            print("\nDetailed breakdown of non-unanimous votes:")
-            vote_types = {}
-            for vote in non_unanimous_votes:
-                vote_type = vote['vote_type']
-                vote_types[vote_type] = vote_types.get(vote_type, 0) + 1
-            for vote_type, count in sorted(vote_types.items()):
-                print(f"{vote_type}: {count} votes")
     else:
         print("No vote records found")
 
 if __name__ == "__main__":
-    # Test with a single recent Common Council PDF
-    test_pdf = "downloaded_minutes/COMMON_COUNCIL/2025-05-06.pdf"
-    process_single_pdf(test_pdf) 
+    import sys
+    if len(sys.argv) > 1:
+        pdf_path = sys.argv[1]
+        process_single_pdf(pdf_path)
+    else:
+        print("Usage: python extract_votes.py <pdf_path>") 
