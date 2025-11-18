@@ -30,11 +30,13 @@ The project consists of several scripts that work in a sequence:
    - Loops through all PDFs in the Common Council folder
    - Calls `extract_votes.py` for each PDF
    - Handles errors and provides progress updates
+   - Supports date range filtering with `--start-date` and `--end-date` arguments
 
 5. `combine_and_load.py`: Creates and populates the database
    - Combines all CSV files from processed PDFs
    - Creates DuckDB database with tables and views
    - Loads all voting data into the database
+   - Supports date range filtering with `--start-date` and `--end-date` arguments
 
 6. `query_votes.py`: Streamlit app to query the database
    - Simple query editor to write queries against the database
@@ -76,11 +78,11 @@ python scraper.py
 # 2. Organize the PDFs
 python organize_minutes.py
 
-# 3. Process all PDFs
-python process_all_pdfs.py
+# 3. Process all PDFs (optionally with date range)
+python process_all_pdfs.py [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
 
-# 4. Update the database
-python combine_and_load.py
+# 4. Update the database (optionally with date range)
+python combine_and_load.py [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD]
 ```
 
 ### Querying the Data
@@ -103,8 +105,12 @@ result = db.execute("""
 
 ## Data Sources
 
-The voting data is extracted from official Madison City Council meeting minutes PDFs, which are publicly available through the City of Madison's legislative information system (Legistar).
+The data is sourced from Madison's Legistar system, which contains official meeting minutes and voting records for all city meetings. The PDFs are downloaded from the Legistar website and processed to extract structured voting data.
 
 ## Note
 
-PDF and CSV files are not included in the repository to keep it lightweight. The processed data is available in the DuckDB database file. 
+PDF and CSV files are not included in the repository to keep it lightweight. The processed data is available in the DuckDB database file.
+
+## Unapproved Minutes
+
+The script includes automatic detection and handling for unapproved (non-finalized) meeting minutes, which have a different format with narrative text like "A motion was made by X, seconded by Y...". This functionality is based on a single example and may need refinement as more unapproved minutes are encountered. 
