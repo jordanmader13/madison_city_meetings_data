@@ -36,7 +36,13 @@ The project consists of several scripts that work in a sequence:
    - Creates DuckDB database with tables and views
    - Loads all voting data into the database
 
-6. `query_votes.py`: Streamlit app to query the database
+6. `fetch_alders.py`: Fetches alder (council member) data from Legistar API
+   - Downloads council member records including district, term dates, contact info
+   - Downloads committee membership records for each alder
+   - Saves to `alders.csv` and `alder_committees.csv`
+   - Run `python combine_and_load.py --alders-only` to load into database
+
+7. `query_votes.py`: Streamlit app to query the database
    - Simple query editor to write queries against the database
    - This is just a simple way to interact with the DuckDB rather than interactively in a python console or something
 
@@ -47,11 +53,16 @@ The data is stored in a DuckDB database (`madison_votes.db`) with the following 
 ### Tables
 - `votes_summary`: Contains summary information for each vote
 - `votes_by_member`: Contains individual voting records for each council member
+- `alders`: Dimension table of council members with district, term dates, and contact info
+- `alder_committees`: Committee membership records for each alder
 
 ### Views
 - `votes_with_voters`: Combines vote summaries with lists of who voted which way
 - `non_unanimous_votes`: Shows all non-unanimous votes with vote counts
 - `member_voting_patterns`: Summary of votes by council member
+- `current_alders`: Currently serving council members (filtered by end_date)
+- `current_committee_assignments`: Current committee assignments joined with alder info
+- `votes_with_alder_info`: Votes joined with alder district and term info
 
 ## Data Format
 
@@ -83,6 +94,18 @@ python process_all_pdfs.py
 python combine_and_load.py
 ```
 
+### Updating Alder Data
+
+To refresh alder and committee membership data from Legistar:
+
+```bash
+# Fetch alder and committee data from API
+python fetch_alders.py
+
+# Load into database (without reprocessing votes)
+python combine_and_load.py --alders-only
+```
+
 ### Querying the Data
 
 1. Launch the Streamlit app:
@@ -95,10 +118,28 @@ streamlit run query_votes.py
 import duckdb
 db = duckdb.connect('madison_votes.db')
 result = db.execute("""
-    SELECT * FROM votes_with_voters 
-    WHERE NOT is_unanimous 
+    SELECT * FROM votes_with_voters
+    WHERE NOT is_unanimous
     ORDER BY meeting_date DESC
 """).fetchdf()
+```
+
+3. Example alder queries:
+```sql
+-- Current council members by district
+SELECT full_name, district, start_date, end_date
+FROM current_alders ORDER BY district;
+
+-- Committee assignments for each alder
+SELECT full_name, district, COUNT(*) as committees
+FROM current_committee_assignments
+GROUP BY full_name, district ORDER BY district;
+
+-- Voting patterns by district
+SELECT district, vote_type, COUNT(*) as count
+FROM votes_with_alder_info
+WHERE NOT is_unanimous AND district IS NOT NULL
+GROUP BY district, vote_type ORDER BY district;
 ```
 
 ## Data Sources
