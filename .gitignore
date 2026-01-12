@@ -1,6 +1,9 @@
 # Ignore the entire downloaded_minutes directory
 downloaded_minutes/
 
+# CSV files (data is in DuckDB database)
+*.csv
+
 # Python related
 __pycache__/
 *.py[cod]
