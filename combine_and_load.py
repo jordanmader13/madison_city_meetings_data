@@ -3,6 +3,168 @@ from pathlib import Path
 import pandas as pd
 import duckdb
 
+
+def load_alders_to_db():
+    """Load alders dimension table from alders.csv into DuckDB."""
+    alders_file = Path("alders.csv")
+    if not alders_file.exists():
+        print("No alders.csv found - run fetch_alders.py first")
+        return False
+
+    print("Loading alders dimension table...")
+    alders_df = pd.read_csv(alders_file)
+
+    db = duckdb.connect('madison_votes.db')
+    try:
+        db.execute("""
+            CREATE OR REPLACE TABLE alders (
+                person_id INTEGER,
+                full_name VARCHAR,
+                first_name VARCHAR,
+                last_name VARCHAR,
+                district INTEGER,
+                member_type VARCHAR,
+                start_date DATE,
+                end_date DATE,
+                email VARCHAR,
+                extra_text VARCHAR,
+                address VARCHAR,
+                city VARCHAR,
+                state VARCHAR,
+                zip VARCHAR,
+                phone VARCHAR,
+                website VARCHAR
+            )
+        """)
+
+        db.register('alders_df', alders_df)
+        db.execute("""
+            INSERT INTO alders
+            SELECT
+                person_id,
+                full_name,
+                first_name,
+                last_name,
+                district,
+                member_type,
+                CAST(start_date AS DATE),
+                CAST(end_date AS DATE),
+                email,
+                extra_text,
+                address,
+                city,
+                state,
+                zip,
+                phone,
+                website
+            FROM alders_df
+        """)
+
+        alder_count = db.execute("SELECT COUNT(*) FROM alders").fetchone()[0]
+        print(f"Loaded {alder_count} alder records")
+
+        # Create a view for current alders
+        db.execute("""
+            CREATE OR REPLACE VIEW current_alders AS
+            SELECT *
+            FROM alders
+            WHERE end_date >= CURRENT_DATE
+            ORDER BY district
+        """)
+
+        current_count = db.execute("SELECT COUNT(*) FROM current_alders").fetchone()[0]
+        print(f"Current alders: {current_count}")
+
+        # Create a view joining votes with alder info
+        db.execute("""
+            CREATE OR REPLACE VIEW votes_with_alder_info AS
+            SELECT
+                v.meeting_date,
+                v.item_number,
+                v.motion_number,
+                v.motion_type,
+                v.legistar_number,
+                v.member_name,
+                v.vote_type,
+                v.is_unanimous,
+                a.district,
+                a.email,
+                a.start_date as term_start,
+                a.end_date as term_end
+            FROM votes_by_member v
+            LEFT JOIN alders a
+                ON v.member_name = a.full_name
+                AND v.meeting_date BETWEEN a.start_date AND a.end_date
+            WHERE v.member_name != 'ALL_PRESENT'
+            ORDER BY v.meeting_date DESC, a.district
+        """)
+
+        print("Created votes_with_alder_info view")
+
+        # Load alder committees if available
+        committees_file = Path("alder_committees.csv")
+        if committees_file.exists():
+            print("\nLoading alder committees...")
+            committees_df = pd.read_csv(committees_file)
+
+            db.execute("""
+                CREATE OR REPLACE TABLE alder_committees (
+                    person_id INTEGER,
+                    body_id INTEGER,
+                    body_name VARCHAR,
+                    member_type VARCHAR,
+                    title VARCHAR,
+                    start_date DATE,
+                    end_date DATE
+                )
+            """)
+
+            db.register('committees_df', committees_df)
+            db.execute("""
+                INSERT INTO alder_committees
+                SELECT
+                    person_id,
+                    body_id,
+                    body_name,
+                    member_type,
+                    title,
+                    CAST(start_date AS DATE),
+                    CAST(end_date AS DATE)
+                FROM committees_df
+            """)
+
+            committee_count = db.execute("SELECT COUNT(*) FROM alder_committees").fetchone()[0]
+            print(f"Loaded {committee_count} committee membership records")
+
+            # Create a view for current committee assignments
+            db.execute("""
+                CREATE OR REPLACE VIEW current_committee_assignments AS
+                SELECT
+                    a.full_name,
+                    a.district,
+                    c.body_name,
+                    c.member_type,
+                    c.title,
+                    c.start_date,
+                    c.end_date
+                FROM alder_committees c
+                JOIN alders a ON c.person_id = a.person_id
+                WHERE c.end_date >= CURRENT_DATE
+                  AND a.end_date >= CURRENT_DATE
+                ORDER BY a.district, c.body_name
+            """)
+
+            print("Created current_committee_assignments view")
+
+        return True
+
+    except Exception as e:
+        print(f"Error loading alders data: {e}")
+        return False
+    finally:
+        db.close()
+
+
 def combine_and_load_to_db():
     """Combine all CSV files and load them into DuckDB."""
     # Get the directory containing the CSVs
@@ -240,11 +402,21 @@ def combine_and_load_to_db():
             GROUP BY vote_type
             ORDER BY count DESC
         """).fetch_df().to_string())
-        
+
+        # Load alders dimension table if available
+        print("\n" + "-" * 50)
+        db.close()
+        load_alders_to_db()
+        return
+
     except Exception as e:
         print(f"Error loading data into DuckDB: {e}")
     finally:
         db.close()
 
 if __name__ == "__main__":
-    combine_and_load_to_db() 
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--alders-only":
+        load_alders_to_db()
+    else:
+        combine_and_load_to_db()
